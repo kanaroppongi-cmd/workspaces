@@ -8,6 +8,7 @@
 <link rel="manifest" href="manifest.json">
 <link rel="apple-touch-icon" href="icon-192.png">
 <meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="完食帖">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.19.2/dist/ort.min.js"></script>
 <style>
@@ -34,6 +35,7 @@ body{
   min-height:100vh;
 }
 button{font-family:inherit;cursor:pointer}
+:focus-visible{outline:2px solid var(--shu);outline-offset:2px}
 .wrap{max-width:560px;margin:0 auto;min-height:100vh;display:flex;flex-direction:column}
 
 /* ── 表紙(ヘッダー) ───────────────────── */
@@ -159,7 +161,10 @@ main::before{ /* 綴じ穴の点線 */
 @media(prefers-reduced-motion:reduce){.pressed{animation:none}}
 .result-title{text-align:center;font-family:var(--serif);font-size:1.25rem;font-weight:700}
 .result-meta{text-align:center;font-size:.8rem;color:var(--sumi-soft);margin:4px 0 12px}
-.conf-note{font-size:.72rem;color:var(--sumi-soft);text-align:center;margin-bottom:12px}
+.conf-note{font-size:.72rem;color:var(--sumi-soft);text-align:center;margin-bottom:12px;line-height:1.7}
+.errbox{background:#fff;border:1.5px solid var(--paper-line);border-radius:10px;padding:9px 11px;
+  font-size:.66rem;color:var(--sumi-soft);font-family:ui-monospace,Menlo,Consolas,monospace;
+  word-break:break-all;margin-bottom:12px;line-height:1.6}
 .top3{background:#fff;border:1.5px solid var(--paper-line);border-radius:12px;padding:12px;margin-bottom:12px}
 .t3row{display:flex;align-items:center;gap:8px;font-size:.8rem;margin:6px 0}
 .t3row .nm{width:9.5em;flex-shrink:0}
@@ -193,6 +198,8 @@ input[type=range]{width:100%}
 .toast.show{opacity:.94}
 .rarity-legend{font-size:.7rem;color:var(--sumi-soft);line-height:1.9;margin-top:4px}
 .empty-note{text-align:center;color:#A79C88;font-size:.8rem;padding:32px 0}
+.diag{font-size:.68rem;color:var(--sumi-soft);line-height:1.8;font-family:ui-monospace,Menlo,Consolas,monospace;
+  background:#fff;border:1.5px solid var(--paper-line);border-radius:10px;padding:10px 12px}
 </style>
 </head>
 <body>
@@ -200,7 +207,7 @@ input[type=range]{width:100%}
 <header>
   <div class="head-row">
     <div>
-      <div class="title-plate">完食帖<small>TABEMONO STAMP RALLY</small></div>
+      <div class="title-plate" id="titlePlate"></div>
       <div style="margin-top:10px;font-size:.7rem"><span class="model-dot" id="modelDot"></span><span id="modelStatus">モデル読込前</span></div>
     </div>
     <div class="head-right">
@@ -264,6 +271,12 @@ input[type=range]{width:100%}
     <p>ランダムな料理と確信度で判定を疑似的に行います。model.onnx を置く前のUI確認用です。</p>
   </div>
   <div class="set-row">
+    <label>モデルの状態</label>
+    <div class="diag" id="diagBox">—</div>
+    <div class="btnrow"><button class="btn ghost" id="btnDiag">読み込みをためす</button></div>
+    <p>入力サイズやファイルの不一致があればここに表示されます。</p>
+  </div>
+  <div class="set-row">
     <label>レア度の基準</label>
     <div class="rarity-legend">
       <b>SS</b> … 日本ではまず出会えない(8種)<br>
@@ -289,8 +302,43 @@ input[type=range]{width:100%}
 
 <script>
 "use strict";
+
+/* ═══════════════════════════════════════════════════════
+   ★ 設定エリア ★  変更するのはここだけで済みます
+   ═══════════════════════════════════════════════════════ */
+
+/* --- アプリの名前 --------------------------------------
+   ここを書き換えるとヘッダーの題箋とブラウザのタブ名が変わります。
+   ホーム画面に追加したときの名前は manifest.json 側も直してください。 */
+const APP_TITLE    = "完食帖";
+const APP_SUBTITLE = "TABEMONO STAMP RALLY";
+
+/* --- モデル --------------------------------------------
+   MODEL_INPUT_SIZE : model.onnx の入力サイズ。今回のモデルは 448。
+   MODEL_RESIZE_SIZE: 短辺をこのサイズに縮めてから中央を切り抜きます。
+                      学習時の resize/centercrop 比率(256/224)に合わせて 512。
+   MODEL_EXTERNAL_DATA:
+      重みを埋め込んだ単一ファイルなら null。
+      model.onnx + model.onnx.data の2ファイル構成なら "model.onnx.data"。 */
+const MODEL_URL           = "model.onnx";
+const MODEL_INPUT_SIZE    = 448;
+const MODEL_RESIZE_SIZE   = 512;
+const MODEL_EXTERNAL_DATA = null;
+
+/* --- 正規化 --------------------------------------------
+   学習時と同じ値にしてください(下は ImageNet 標準値)。 */
+const NORM_MEAN = [0.485, 0.456, 0.406];
+const NORM_STD  = [0.229, 0.224, 0.225];
+
+/* --- クラスの並び順 ------------------------------------
+   "official" : Food-101 公式 classes.txt の順(cheesecake → cheese_plate)
+   "ascii"    : ImageFolder 等のASCIIソート順(cheese_plate → cheesecake)
+   学習コードの class_to_idx を確認して合わせてください。
+   ここを間違えると、チーズケーキとチーズプレートだけが入れ替わります。 */
+const CLASS_ORDER = "official";
+
 /* ═══════════ データ定義 ═══════════ */
-// Food-101 クラス(アルファベット順 = モデル出力のインデックス順)
+// Food-101 クラス(公式 classes.txt 順)
 // r: レア度(日本での食べにくさ基準)
 const FOODS = [
 {id:"apple_pie",ja:"アップルパイ",r:"C"},
@@ -400,6 +448,15 @@ const RARITY_TOTAL = {};
 FOODS.forEach(f=>RARITY_TOTAL[f.r]=(RARITY_TOTAL[f.r]||0)+1);
 const FOOD_BY_ID = Object.fromEntries(FOODS.map(f=>[f.id,f]));
 
+/* モデル出力インデックス → FOODS の添字。
+   ASCIIソートで学習した場合、cheese_plate(17) と cheesecake(16) が入れ替わる。 */
+const MODEL_INDEX_TO_FOOD = (()=>{
+  const map = FOODS.map((_,i)=>i);
+  if(CLASS_ORDER === "ascii"){ map[16]=17; map[17]=16; }
+  return map;
+})();
+const foodAt = i => FOODS[MODEL_INDEX_TO_FOOD[i]];
+
 /* ═══════════ 保存データ ═══════════ */
 const STORE_KEY = "kanshoku_v1";
 let state = load();
@@ -427,7 +484,7 @@ function fmtDate(iso){
   return `${d.getFullYear()}.${String(d.getMonth()+1).padStart(2,"0")}.${String(d.getDate()).padStart(2,"0")}`;
 }
 function hash(s){let h=0;for(const c of s)h=(h*31+c.charCodeAt(0))|0;return h;}
-function esc(s){return s.replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
 
 /* ═══════════ スタンプSVG生成 ═══════════ */
 let uidSeq = 0;
@@ -490,6 +547,10 @@ function stampSVG(food, dateIso, animate=false){
 /* ═══════════ 一覧描画 ═══════════ */
 let filterStatus = "all";
 let filterRarity = new Set(); // 空=すべて
+function renderTitle(){
+  document.title = `${APP_TITLE} — たべものスタンプラリー`;
+  $("#titlePlate").innerHTML = `${esc(APP_TITLE)}<small>${esc(APP_SUBTITLE)}</small>`;
+}
 function renderHeader(){
   const done = Object.keys(state.stamps).length;
   $("#doneCount").textContent = done;
@@ -529,42 +590,45 @@ function renderGrid(){
 function renderAll(){ renderHeader(); renderChips(); renderGrid(); }
 
 /* ═══════════ モデル(ONNX Runtime Web) ═══════════ */
-const MODEL_URL = "model.onnx";
-const INPUT_SIZE = 224;
-let session = null, modelState = "idle"; // idle|loading|ready|error
+let session = null, modelState = "idle", modelError = null; // idle|loading|ready|error
 function setModelUI(){
   const dot=$("#modelDot"), st=$("#modelStatus");
   if(state.demo){ dot.className="model-dot demo"; st.textContent="デモモード"; return; }
   dot.className = "model-dot " + ({ready:"ok",error:"err"}[modelState]||"");
-  st.textContent = {idle:"モデル読込前",loading:"モデル読込中…",ready:"モデル準備完了",error:"モデル未検出"}[modelState];
+  st.textContent = {idle:"モデル読込前",loading:"モデル読込中…",ready:"モデル準備完了",error:"モデル読込エラー"}[modelState];
 }
 async function ensureSession(){
   if(session) return session;
-  if(modelState==="loading") throw new Error("loading");
   modelState="loading"; setModelUI();
   try{
-    session = await ort.InferenceSession.create(MODEL_URL, {executionProviders:["wasm"]});
-    modelState="ready";
+    const opts = {executionProviders:["wasm"]};
+    if(MODEL_EXTERNAL_DATA){
+      opts.externalData = [{ path: MODEL_EXTERNAL_DATA, data: "./" + MODEL_EXTERNAL_DATA }];
+    }
+    session = await ort.InferenceSession.create(MODEL_URL, opts);
+    modelState="ready"; modelError=null;
+    console.info("[model] inputs:", session.inputNames, "outputs:", session.outputNames);
   }catch(e){
-    modelState="error"; session=null;
+    console.error("[model] 読み込みに失敗:", e);
+    modelState="error"; modelError=e; session=null;
     throw e;
   }finally{ setModelUI(); }
   return session;
 }
 function preprocess(img){
-  const S=256, C=INPUT_SIZE;
+  const S=MODEL_RESIZE_SIZE, C=MODEL_INPUT_SIZE;
   const iw=img.naturalWidth||img.width, ih=img.naturalHeight||img.height;
   const sc=S/Math.min(iw,ih), rw=iw*sc, rh=ih*sc;
   const cv=document.createElement("canvas"); cv.width=C; cv.height=C;
   const ctx=cv.getContext("2d",{willReadFrequently:true});
+  ctx.fillStyle="#fff"; ctx.fillRect(0,0,C,C); // 透過PNG対策
   ctx.drawImage(img,(C-rw)/2,(C-rh)/2,rw,rh);
   const {data}=ctx.getImageData(0,0,C,C);
-  const mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225];
   const f=new Float32Array(3*C*C), N=C*C;
   for(let i=0;i<N;i++){
-    f[i]      =(data[i*4]  /255-mean[0])/std[0];
-    f[N+i]    =(data[i*4+1]/255-mean[1])/std[1];
-    f[2*N+i]  =(data[i*4+2]/255-mean[2])/std[2];
+    f[i]     =(data[i*4]  /255-NORM_MEAN[0])/NORM_STD[0];
+    f[N+i]   =(data[i*4+1]/255-NORM_MEAN[1])/NORM_STD[1];
+    f[2*N+i] =(data[i*4+2]/255-NORM_MEAN[2])/NORM_STD[2];
   }
   return new ort.Tensor("float32", f, [1,3,C,C]);
 }
@@ -587,7 +651,11 @@ async function classify(img){
   const sess = await ensureSession();
   const feeds = {}; feeds[sess.inputNames[0]] = preprocess(img);
   const out = await sess.run(feeds);
-  const probs = softmaxIfNeeded(out[sess.outputNames[0]].data);
+  const raw = out[sess.outputNames[0]].data;
+  if(raw.length !== FOODS.length){
+    throw new Error(`出力が ${raw.length} 個ですが、料理リストは ${FOODS.length} 件です。モデルとクラス一覧が一致していません。`);
+  }
+  const probs = softmaxIfNeeded(raw);
   return probs.map((p,i)=>({i,p})).sort((a,b)=>b.p-a.p).slice(0,3);
 }
 function makeThumb(img){
@@ -599,45 +667,69 @@ function makeThumb(img){
 }
 
 /* ═══════════ 判定フロー ═══════════ */
-let currentImg=null, currentTop3=null;
+let currentImg=null, currentTop3=null, previewUrl=null;
+const JUDGING = `<div class="judging"><div class="spin"></div>判定中…</div>`;
+
+// EXIF の回転情報を反映して読み込む(iPhoneの縦写真対策)
+async function loadImage(file){
+  if(window.createImageBitmap){
+    try{ return await createImageBitmap(file, {imageOrientation:"from-image"}); }
+    catch(e){ /* 非対応ブラウザは下の従来方式へ */ }
+  }
+  return await new Promise((res,rej)=>{
+    const img=new Image(), u=URL.createObjectURL(file);
+    img.onload=()=>{ URL.revokeObjectURL(u); res(img); };
+    img.onerror=()=>{ URL.revokeObjectURL(u); rej(new Error("画像を読み込めませんでした")); };
+    img.src=u;
+  });
+}
+function showLoadError(e){
+  const msg = (e && e.message) ? e.message : String(e);
+  const hint = /no such file|404|failed to fetch|Load model/i.test(msg)
+    ? `model.onnx がアプリと同じフォルダにあるか確認してください。${MODEL_EXTERNAL_DATA?`<br>2ファイル構成なので ${esc(MODEL_EXTERNAL_DATA)} も必要です。`:""}`
+    : /invalid dimensions|Got invalid dimensions|shape/i.test(msg)
+    ? `入力サイズが合っていません。設定エリアの MODEL_INPUT_SIZE をモデルの値に合わせてください(現在 ${MODEL_INPUT_SIZE})。`
+    : `詳しい内容はブラウザのコンソールに出ています。`;
+  $("#rBody").innerHTML=`
+    <div class="fail-face">📖</div>
+    <div class="result-title" style="font-size:1rem">判定できませんでした</div>
+    <p class="conf-note">${hint}</p>
+    <div class="errbox">${esc(msg)}</div>
+    <div class="btnrow">
+      <button class="btn ghost" data-close="mResult">閉じる</button>
+      <button class="btn pri" id="btnDemoOn">デモモードで試す</button>
+    </div>`;
+  $("#btnDemoOn").onclick=()=>{ state.demo=true; save(); setModelUI(); handleReclassify(); };
+}
 async function handleFile(file){
   if(!file) return;
-  const url=URL.createObjectURL(file);
-  const img=new Image();
-  img.onload=async ()=>{
-    currentImg=img;
-    $("#rPreview").src=url;
-    $("#rBody").innerHTML=`<div class="judging"><div class="spin"></div>判定中…</div>`;
-    openModal("mResult");
-    try{
-      currentTop3 = await classify(img);
-      showResult();
-    }catch(e){
-      $("#rBody").innerHTML=`
-        <div class="fail-face">📖</div>
-        <div class="result-title" style="font-size:1rem">モデル(model.onnx)が見つかりません</div>
-        <p class="conf-note">アプリと同じフォルダに model.onnx を配置してください。<br>先にUIを試したい場合はデモモードをどうぞ。</p>
-        <div class="btnrow">
-          <button class="btn ghost" data-close="mResult">閉じる</button>
-          <button class="btn pri" id="btnDemoOn">デモモードで試す</button>
-        </div>`;
-      $("#btnDemoOn").onclick=()=>{ state.demo=true; save(); setModelUI(); handleReclassify(); };
-    }
-  };
-  img.src=url;
+  if(previewUrl){ URL.revokeObjectURL(previewUrl); }
+  previewUrl = URL.createObjectURL(file);
+  $("#rPreview").src = previewUrl;
+  $("#rBody").innerHTML = JUDGING;
+  openModal("mResult");
+  try{
+    currentImg = await loadImage(file);
+    currentTop3 = await classify(currentImg);
+    showResult();
+  }catch(e){
+    console.error("[判定] 失敗:", e);
+    showLoadError(e);
+  }
 }
 function handleReclassify(){
-  if(currentImg){
-    $("#rBody").innerHTML=`<div class="judging"><div class="spin"></div>判定中…</div>`;
-    classify(currentImg).then(t=>{currentTop3=t; showResult();});
-  }
+  if(!currentImg) return;
+  $("#rBody").innerHTML = JUDGING;
+  classify(currentImg)
+    .then(t=>{ currentTop3=t; showResult(); })
+    .catch(e=>{ console.error("[判定] 失敗:", e); showLoadError(e); });
 }
 function showResult(){
   const [t1]=currentTop3;
-  const food=FOODS[t1.i];
+  const food=foodAt(t1.i);
   const pct=v=>(v*100).toFixed(1)+"%";
   const top3Html=`<div class="top3">${currentTop3.map((t,k)=>`
-    <div class="t3row"><span class="nm">${k+1}. ${esc(FOODS[t.i].ja)}</span>
+    <div class="t3row"><span class="nm">${k+1}. ${esc(foodAt(t.i).ja)}</span>
     <span class="bar"><i style="width:${Math.min(100,t.p*100)}%"></i></span>
     <span class="pc">${pct(t.p)}</span></div>`).join("")}</div>`;
 
@@ -758,7 +850,25 @@ $("#openSettings").onclick=()=>{
   $("#thRange").value=state.threshold;
   $("#thVal").textContent=(state.threshold*100).toFixed(0)+"%";
   $("#demoToggle").checked=state.demo;
+  renderDiag();
   openModal("mSettings");
+};
+function renderDiag(){
+  const lines = [
+    `ファイル: ${MODEL_URL}${MODEL_EXTERNAL_DATA?" + "+MODEL_EXTERNAL_DATA:" (単一ファイル)"}`,
+    `想定入力: 1×3×${MODEL_INPUT_SIZE}×${MODEL_INPUT_SIZE}`,
+    `クラス順: ${CLASS_ORDER}`,
+    `状態: ${ {idle:"未読込",loading:"読込中",ready:"準備完了",error:"エラー"}[modelState] }`,
+  ];
+  if(session) lines.push(`入力名: ${session.inputNames.join(",")} / 出力名: ${session.outputNames.join(",")}`);
+  if(modelError) lines.push(`エラー: ${esc(modelError.message||modelError)}`);
+  $("#diagBox").innerHTML = lines.join("<br>");
+}
+$("#btnDiag").onclick=async ()=>{
+  $("#diagBox").textContent="読み込み中…";
+  try{ await ensureSession(); toast("モデルを読み込めました"); }
+  catch(e){ toast("読み込めませんでした"); }
+  renderDiag();
 };
 $("#thRange").oninput=e=>{
   state.threshold=parseFloat(e.target.value);
@@ -769,9 +879,11 @@ $("#demoToggle").onchange=e=>{ state.demo=e.target.checked; save(); setModelUI()
 $("#btnExport").onclick=()=>{
   const blob=new Blob([JSON.stringify(state,null,1)],{type:"application/json"});
   const a=document.createElement("a");
-  a.href=URL.createObjectURL(blob);
+  const u=URL.createObjectURL(blob);
+  a.href=u;
   a.download=`kanshoku_${new Date().toISOString().slice(0,10)}.json`;
   a.click();
+  setTimeout(()=>URL.revokeObjectURL(u),1000);
 };
 $("#btnImport").onclick=()=>$("#fileImport").click();
 $("#fileImport").onchange=e=>{
@@ -793,7 +905,7 @@ $("#btnReset").onclick=()=>{
 };
 
 /* ═══════════ 起動 ═══════════ */
-renderAll(); setModelUI();
+renderTitle(); renderAll(); setModelUI();
 if("serviceWorker" in navigator){
   navigator.serviceWorker.register("service-worker.js").catch(()=>{});
 }
