@@ -273,8 +273,11 @@ input[type=range]{width:100%}
   <div class="set-row">
     <label>モデルの状態</label>
     <div class="diag" id="diagBox">—</div>
-    <div class="btnrow"><button class="btn ghost" id="btnDiag">読み込みをためす</button></div>
-    <p>入力サイズやファイルの不一致があればここに表示されます。</p>
+    <div class="btnrow">
+      <button class="btn ghost" id="btnDiag">読み込みをためす</button>
+      <button class="btn ghost" id="btnCacheModel">端末に保存</button>
+    </div>
+    <p>入力サイズやファイルの不一致があればここに表示されます。<br>端末に保存しておくと、電波の無い場所でも判定できます(約17MB)。</p>
   </div>
   <div class="set-row">
     <label>レア度の基準</label>
@@ -851,6 +854,7 @@ $("#openSettings").onclick=()=>{
   $("#thVal").textContent=(state.threshold*100).toFixed(0)+"%";
   $("#demoToggle").checked=state.demo;
   renderDiag();
+  askSW({type:"MODEL_STATUS"});
   openModal("mSettings");
 };
 function renderDiag(){
@@ -861,9 +865,35 @@ function renderDiag(){
     `状態: ${ {idle:"未読込",loading:"読込中",ready:"準備完了",error:"エラー"}[modelState] }`,
   ];
   if(session) lines.push(`入力名: ${session.inputNames.join(",")} / 出力名: ${session.outputNames.join(",")}`);
+  lines.push(`端末に保存: ${modelCached===null?"未確認":(modelCached?"済み":"未保存")}`);
   if(modelError) lines.push(`エラー: ${esc(modelError.message||modelError)}`);
   $("#diagBox").innerHTML = lines.join("<br>");
 }
+/* Service Worker に頼んでモデルを端末に保存する */
+let modelCached = null;
+function askSW(payload){
+  if(navigator.serviceWorker && navigator.serviceWorker.controller){
+    navigator.serviceWorker.controller.postMessage(payload);
+  }
+}
+if("serviceWorker" in navigator){
+  navigator.serviceWorker.addEventListener("message", e=>{
+    const m = e.data || {};
+    if(m.type==="MODEL_STATUS"){ modelCached = m.cached; renderDiag(); }
+    if(m.type==="MODEL_CACHED"){
+      if(m.ok){ modelCached = true; toast("モデルを端末に保存しました"); }
+      else { toast("保存できませんでした"); console.error("[sw]", m.error); }
+      renderDiag();
+    }
+  });
+}
+$("#btnCacheModel").onclick=()=>{
+  if(!(navigator.serviceWorker && navigator.serviceWorker.controller)){
+    toast("ページを再読み込みしてからお試しください"); return;
+  }
+  toast("保存しています…");
+  askSW({type:"CACHE_MODEL"});
+};
 $("#btnDiag").onclick=async ()=>{
   $("#diagBox").textContent="読み込み中…";
   try{ await ensureSession(); toast("モデルを読み込めました"); }
